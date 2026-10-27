@@ -50,7 +50,9 @@ import Text.Pandoc.Writers.Markdown.Inline (inlineListToMarkdown,
                                             linkAttributes,
                                             attrsToMarkdown,
                                             attrsToMarkua,
-                                            linkDestination)
+                                            linkDestination,
+                                            escapeText,
+                                            escapeLinkTitle)
 import Text.Pandoc.Writers.Markdown.Table (pipeTable, pandocTable)
 import Text.Pandoc.Writers.Markdown.Types (MarkdownVariant(..),
                                            WriterState(..),
@@ -282,7 +284,7 @@ keyToMarkdown :: PandocMonad m
 keyToMarkdown opts (label', (src, tit), attr) = do
   let tit' = if T.null tit
                 then empty
-                else space <> "\"" <> literal tit <> "\""
+                else space <> "\"" <> literal (escapeLinkTitle tit) <> "\""
   return $ nest 2 $ hang 2
             ("[" <> literal label' <> "]:" <> space)
             (literal (linkDestination src) <> tit')
@@ -455,7 +457,28 @@ blockToMarkdown' opts (Plain inlines) = do
               (t == "%" && isEnabled Ext_pandoc_title_block opts &&
                            isEnabled Ext_all_symbols_escapable opts)
             -> RawInline (Format "markdown") "\\" : ils
+          (Str t:ys)
+            | isDashOrEqualsRun t
+            , escapeText opts t == t
+            , null ys || startsWithSpace ys
+            -- a line of only dashes or equals would be read back as a
+            -- thematic break or setext heading underline (#11992);
+            -- if escapeText escapes anything, the rendered line is
+            -- already safe
+            -> RawInline (Format "markdown") "\\" : ils
           _ -> ils
+  -- Escape a final run of dashes or equals, which wrapping could turn
+  -- into a setext heading underline or thematic break on its own line
+  -- (#11992).
+  let escapeLineEnd ils =
+        case reverse (dropWhile (== Space) (reverse ils)) of
+          (Str t:rest)
+            | isDashOrEqualsRun t
+            , escapeText opts t == t
+            -> reverse rest ++ [RawInline (Format "markdown") "\\", Str t]
+          _ -> ils
+  let isDashOrEqualsRun t =
+        not (T.null t) && (T.all (== '-') t || T.all (== '=') t)
   -- apply escapeLineStart to the head of the list, then after each LineBreak
   let go ils = case ils of
                  []             -> []
@@ -464,7 +487,7 @@ blockToMarkdown' opts (Plain inlines) = do
   let inlines' =
         if variant == PlainText
            then inlines
-           else go (escapeLineStart inlines)
+           else go (escapeLineStart (escapeLineEnd inlines))
   contents <- inlineListToMarkdown opts inlines'
   return $ contents <> cr
 blockToMarkdown' opts (Para inlines) =

@@ -15,7 +15,9 @@ module Text.Pandoc.Writers.Markdown.Inline (
   linkAttributes,
   attrsToMarkdown,
   attrsToMarkua,
-  linkDestination
+  linkDestination,
+  escapeText,
+  escapeLinkTitle
   ) where
 import Control.Monad (when, liftM2)
 import Control.Monad.Reader
@@ -269,7 +271,8 @@ getReference attr label target = do
 inlineListToMarkdown :: PandocMonad m => WriterOptions -> [Inline] -> MD m (Doc Text)
 inlineListToMarkdown opts ils = do
     inlist <- asks envInList
-    avoidBadWraps inlist <$> go ils
+    variant <- asks envVariant
+    avoidBadWraps inlist <$> go (mergeAdjacentCodes opts variant ils)
   where go [] = return empty
         go (x@Math{}:y@(Str t):zs)
           | T.all isDigit (T.take 1 t) -- starts with digit -- see #7058
@@ -319,6 +322,31 @@ inlineListToMarkdown opts ils = do
         isLinkOrSpan Span{} = True
         isLinkOrSpan _ = False
 
+-- | Merge adjacent code inlines when nothing would be written between
+-- them.  Back-to-back code spans like @\`a(\`\`b)\@ read back as a
+-- single code span containing backticks, and Markdown offers no way
+-- to write two code spans with nothing in between, so the closest
+-- faithful output is one code span with the combined text (#11993).
+-- If the first span's attributes would be written after it, the spans
+-- are already separated and no merge is needed.
+mergeAdjacentCodes :: WriterOptions -> MarkdownVariant -> [Inline] -> [Inline]
+mergeAdjacentCodes opts variant = go
+  where
+    go (Code attr1 s1 : rest@(Code _ _ : _))
+      | writesAttrs attr1 = Code attr1 s1 : go rest
+      | otherwise =
+          case rest of
+            (Code _ s2 : rest') -> go (Code attr1 (s1 <> s2) : rest')
+            _                   -> Code attr1 s1 : go rest
+    go (x:xs) = x : go xs
+    go [] = []
+    writesAttrs a = case variant of
+                      Markua -> a /= nullAttr
+                      PlainText -> False
+                      _ -> (isEnabled Ext_inline_code_attributes opts ||
+                            isEnabled Ext_attributes opts) &&
+                           a /= nullAttr
+
 -- Remove breaking spaces that might cause bad wraps.
 avoidBadWraps :: Bool -> Doc Text -> Doc Text
 avoidBadWraps inListItem = go . toList
@@ -341,14 +369,21 @@ avoidBadWraps inListItem = go . toList
 
 -- | Render a link destination, enclosing it in angle brackets if
 -- it contains whitespace, which is not allowed in a bare destination.
+-- In either form, @&@ is escaped when it begins a character
+-- reference, since readers decode character references in link
+-- destinations (#11994).
 linkDestination :: Text -> Text
 linkDestination src
-  | T.any isSpace src = "<" <> T.concatMap escapeChar src <> ">"
-  | otherwise = src
+  | T.any isSpace src = "<" <> T.pack (go True (T.unpack src)) <> ">"
+  | otherwise = T.pack (go False (T.unpack src))
   where
-    escapeChar c
-      | c `elem` ['<', '>', '\\'] = T.pack ['\\', c]
-      | otherwise = T.singleton c
+    go _ ('&':cs)
+      | Right _ <- parse characterReference "" ('&':cs)
+      = '\\' : '&' : go False cs
+    go bracketed (c:cs)
+      | bracketed && c `elem` ['<', '>', '\\'] = '\\' : c : go bracketed cs
+      | otherwise = c : go bracketed cs
+    go _ [] = []
 
 -- | Convert Pandoc inline element to markdown.
 inlineToMarkdown :: PandocMonad m => WriterOptions -> Inline -> MD m (Doc Text)
@@ -655,12 +690,22 @@ inlineToMarkdown opts (Cite (c:cs) lst)
            return $ pdoc <+> r
         modekey SuppressAuthor = "-"
         modekey _              = ""
+-- | Escape a link title for use between double quotes.  Readers
+-- process backslash escapes there, so @\"@ and @\\\\@ would otherwise
+-- change the title or break the link (#11994).
+escapeLinkTitle :: Text -> Text
+escapeLinkTitle = T.concatMap go
+  where
+    go '"'  = "\\\""
+    go '\\' = "\\\\"
+    go c    = T.singleton c
+
 inlineToMarkdown opts lnk@(Link attr@(ident,classes,kvs) txt (src, tit)) = do
   variant <- asks envVariant
   linktext <- inlineListToMarkdown opts txt
   let linktitle = if T.null tit
                      then empty
-                     else literal $ " \"" <> tit <> "\""
+                     else literal $ " \"" <> escapeLinkTitle tit <> "\""
   let srcSuffix = fromMaybe src (T.stripPrefix "mailto:" src)
   let useAuto = isURI src &&
                 T.null ident &&
